@@ -15,6 +15,7 @@ import zipfile
 import py7zr
 import logging
 import requests
+import subprocess
 from requests.auth import HTTPBasicAuth
 import threading
 import markdown2
@@ -635,6 +636,90 @@ def _convert_markdown_to_structured(markdown_content):
     
     return structured
 
+def _structured_to_markdown(content):
+    """Convert structured content back into Markdown for Pandoc processing."""
+    if not isinstance(content, list):
+        return "", True
+
+    lines = []
+    list_buffer = []
+    unsupported = False
+
+    def flush_list():
+        nonlocal list_buffer
+        if list_buffer:
+            for entry in list_buffer:
+                lines.append(f"- {entry}")
+            lines.append("")
+            list_buffer = []
+
+    for item in content:
+        if isinstance(item, str):
+            flush_list()
+            if item:
+                lines.append(item)
+                lines.append("")
+            continue
+
+        if not isinstance(item, dict):
+            flush_list()
+            continue
+
+        item_type = item.get("type")
+        text = str(item.get("text", "")) if item.get("text") is not None else ""
+
+        if item_type == "title":
+            flush_list()
+            lines.append(f"# {text}")
+            lines.append("")
+        elif item_type in {"subtitle", "heading"}:
+            flush_list()
+            lines.append(f"## {text}")
+            lines.append("")
+        elif item_type == "subheading":
+            flush_list()
+            lines.append(f"### {text}")
+            lines.append("")
+        elif item_type == "paragraph":
+            flush_list()
+            lines.append(text)
+            lines.append("")
+        elif item_type == "list":
+            items = item.get("items", [])
+            for entry in items:
+                if entry is not None:
+                    list_buffer.append(str(entry))
+        elif item_type == "bullet":
+            if text:
+                list_buffer.append(text)
+        elif item_type == "bold":
+            flush_list()
+            lines.append(f"**{text}**")
+            lines.append("")
+        elif item_type == "table":
+            flush_list()
+            data = item.get("data") or []
+            if data:
+                header = [str(cell) if cell is not None else "" for cell in data[0]]
+                if header:
+                    lines.append("| " + " | ".join(header) + " |")
+                    lines.append("| " + " | ".join(["---"] * len(header)) + " |")
+                    for row in data[1:]:
+                        row_cells = [str(cell) if cell is not None else "" for cell in row]
+                        lines.append("| " + " | ".join(row_cells) + " |")
+                    lines.append("")
+        elif item_type in {"image", "image_query"}:
+            unsupported = True
+        else:
+            flush_list()
+            if text:
+                lines.append(text)
+                lines.append("")
+
+    flush_list()
+    markdown = "\n".join(lines).strip()
+    return markdown, unsupported
+
 def _create_excel(data: list[list[str]], filename: str, folder_path: str | None = None, title: str | None = None) -> dict:
     log.debug("Creating Excel file with optional template")
     if folder_path is None:
@@ -1050,10 +1135,13 @@ def _create_presentation(slides_data: list[dict], filename: str, folder_path: st
 def _create_word(content: list[dict] | str, filename: str, folder_path: str | None = None, title: str | None = None) -> dict:
     log.debug("Creating Word document")
 
+    original_markdown = content if isinstance(content, str) else None
     if isinstance(content, str):
-        content = _convert_markdown_to_structured(content)
-    elif not isinstance(content, list):
-        content = []
+        structured_content = _convert_markdown_to_structured(content)
+    elif isinstance(content, list):
+        structured_content = content
+    else:
+        structured_content = []
 
     if folder_path is None:
         folder_path = _generate_unique_folder()
@@ -1063,6 +1151,52 @@ def _create_word(content: list[dict] | str, filename: str, folder_path: str | No
         fname = filename
     else:
         filepath, fname = _generate_filename(folder_path, "docx")
+
+    pandoc_input = None
+    unsupported_for_pandoc = False
+    if original_markdown is not None:
+        pandoc_input = original_markdown.strip()
+    else:
+        pandoc_input, unsupported_for_pandoc = _structured_to_markdown(structured_content)
+
+    pandoc_path = shutil.which("pandoc")
+    if pandoc_path and pandoc_input and not unsupported_for_pandoc:
+        temp_md_path = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False, encoding="utf-8") as md_file:
+                temp_md_path = md_file.name
+                md_file.write(pandoc_input)
+
+            cmd = [pandoc_path, temp_md_path, "-o", filepath, "--from", "markdown", "--to", "docx"]
+            if DOCX_TEMPLATE_PATH:
+                cmd.extend(["--reference-doc", DOCX_TEMPLATE_PATH])
+            if title:
+                cmd.extend(["--metadata", f"title={title}"])
+
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode == 0:
+                log.debug("Word document created via Pandoc")
+                if temp_md_path:
+                    try:
+                        os.remove(temp_md_path)
+                    except OSError:
+                        pass
+                return {"url": _public_url(folder_path, fname), "path": filepath}
+            else:
+                log.warning(f"Pandoc conversion failed (code {result.returncode}): {result.stderr.strip()}")
+        except Exception as e:
+            log.warning(f"Pandoc conversion error: {e}")
+        finally:
+            if temp_md_path and os.path.exists(temp_md_path):
+                try:
+                    os.remove(temp_md_path)
+                except OSError:
+                    pass
+    elif pandoc_path and unsupported_for_pandoc:
+        log.debug("Pandoc available but content includes unsupported structures; falling back to python-docx")
+    else:
+        if not pandoc_path:
+            log.debug("Pandoc executable not found; using python-docx fallback")
 
     use_template = False
     doc = None
@@ -1107,7 +1241,7 @@ def _create_word(content: list[dict] | str, filename: str, folder_path: str | No
         title_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         log.debug("Document title added")
 
-    for item in content or []:
+    for item in structured_content or []:
         if isinstance(item, str):
             doc.add_paragraph(item)
         elif isinstance(item, dict):
@@ -1149,6 +1283,24 @@ def _create_word(content: list[dict] | str, filename: str, folder_path: str | No
                         run.font.bold = True
                     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     log.debug("Subtitle added")
+                elif item_type == "heading":
+                    paragraph = doc.add_paragraph(item.get("text", ""))
+                    try:
+                        paragraph.style = doc.styles['Heading 2']
+                    except KeyError:
+                        run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+                        run.font.size = DocxPt(16)
+                        run.font.bold = True
+                    log.debug("Heading added")
+                elif item_type == "subheading":
+                    paragraph = doc.add_paragraph(item.get("text", ""))
+                    try:
+                        paragraph.style = doc.styles['Heading 3']
+                    except KeyError:
+                        run = paragraph.runs[0] if paragraph.runs else paragraph.add_run()
+                        run.font.size = DocxPt(14)
+                        run.font.bold = True
+                    log.debug("Subheading added")
                 elif item_type == "paragraph":
                     doc.add_paragraph(item.get("text", ""))
                     log.debug("Paragraph added")
@@ -1173,6 +1325,18 @@ def _create_word(content: list[dict] | str, filename: str, folder_path: str | No
                             log.debug("Image successfully added")
                         else:
                             log.warning(f"Image search for : '{image_query}'")
+                elif item_type == "bold":
+                    paragraph = doc.add_paragraph()
+                    run = paragraph.add_run(item.get("text", ""))
+                    run.bold = True
+                    log.debug("Bold paragraph added")
+                elif item_type == "bullet":
+                    paragraph = doc.add_paragraph(item.get("text", ""))
+                    try:
+                        paragraph.style = doc.styles['List Bullet']
+                    except KeyError:
+                        paragraph.style = doc.styles['Normal']
+                    log.debug("Bullet added")
                 elif item_type == "table":
                     data = item.get("data", [])
                     if data:
